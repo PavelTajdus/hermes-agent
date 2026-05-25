@@ -2754,6 +2754,80 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""
 
+    @staticmethod
+    def _extract_slash_thread_ts(command: dict) -> str:
+        """Best-effort thread_ts extraction from Slack slash-command payloads.
+
+        Slack's native slash-command payload is primarily channel-scoped, but
+        some invocation surfaces / test fixtures can carry the originating
+        thread timestamp directly or nested under a Block-Kit-like container.
+        Preserve it when present so gateway commands that enqueue follow-up
+        turns (notably /goal) keep replying in the user's thread instead of
+        falling back to channel-level chat_postMessage.
+        """
+        if not isinstance(command, dict):
+            return ""
+
+        for key in ("thread_ts", "thread_id"):
+            value = command.get(key)
+            if value:
+                return str(value)
+
+        for key in ("container", "message", "context"):
+            value = command.get(key)
+            if isinstance(value, dict):
+                nested = value.get("thread_ts") or value.get("thread_id")
+                if nested:
+                    return str(nested)
+
+        return ""
+
+    @staticmethod
+    def _is_new_goal_command_text(text: str) -> bool:
+        """Return True when normalized slash text sets a new /goal."""
+        if not text:
+            return False
+        parts = text.strip().split(None, 1)
+        if not parts or parts[0] != "/goal":
+            return False
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if not arg:
+            return False
+        return arg.lower() not in {"status", "pause", "resume", "clear", "stop", "done"}
+
+    async def _create_goal_thread_anchor(
+        self,
+        channel_id: str,
+        user_id: str,
+        goal: str,
+    ) -> str:
+        """Post one channel-level seed message and return its ts as thread anchor.
+
+        Native Slack slash commands issued at channel level do not include a
+        message ts/thread_ts. Long-running /goal turns need a thread anyway;
+        otherwise every continuation posts into the channel.  The least noisy
+        option is one visible anchor message, with all agent work routed as
+        replies to that message.
+        """
+        if not channel_id:
+            return ""
+        try:
+            preview = " ".join((goal or "").split())[:160]
+            if len((goal or "").strip()) > 160:
+                preview += "…"
+            actor = f" by <@{user_id}>" if user_id else ""
+            text = f":dart: Hermes /goal{actor}: {preview or 'standing goal'}"
+            result = await self._get_client(channel_id).chat_postMessage(
+                channel=channel_id,
+                text=text,
+                mrkdwn=True,
+            )
+            ts = result.get("ts") if isinstance(result, dict) else None
+            return str(ts) if ts else ""
+        except Exception as exc:
+            logger.warning("[Slack] Failed to create /goal thread anchor: %s", exc)
+            return ""
+
     async def _handle_slash_command(self, command: dict) -> None:
         """Handle Slack slash commands.
 
@@ -2773,6 +2847,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        thread_ts = self._extract_slash_thread_ts(command)
 
         # Track which workspace owns this channel
         if team_id and channel_id:
@@ -2801,6 +2876,23 @@ class SlackAdapter(BasePlatformAdapter):
             # gateway command dispatcher by prepending the slash.
             text = f"/{slash_name} {text}".strip()
 
+        # Native Slack slash commands invoked from a top-level channel do not
+        # provide a message ts.  For new /goal commands, create one visible
+        # seed message and use it as the thread anchor so all kickoff and
+        # continuation turns stay contained in a Slack thread.
+        if (
+            not thread_ts
+            and channel_id
+            and not str(channel_id).startswith("D")
+            and self._is_new_goal_command_text(text)
+        ):
+            goal_arg = text.split(None, 1)[1].strip()
+            thread_ts = await self._create_goal_thread_anchor(
+                channel_id=channel_id,
+                user_id=user_id,
+                goal=goal_arg,
+            )
+
         # Slack slash commands can originate from DMs or shared channels.
         # Preserve DM semantics only for DM channel IDs; shared channels must
         # keep group semantics so different users do not collide into one
@@ -2810,6 +2902,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            thread_id=thread_ts or None,
         )
 
         event = MessageEvent(

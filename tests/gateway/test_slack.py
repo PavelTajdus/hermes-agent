@@ -131,6 +131,72 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_id == "D123"
         assert event.source.user_id == "U123"
 
+    @pytest.mark.asyncio
+    async def test_slash_command_preserves_originating_thread(self, adapter):
+        command = {
+            "command": "/goal",
+            "text": "finish the report",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+            "thread_ts": "1779460000.123456",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/goal finish the report"
+        assert event.source.chat_type == "group"
+        assert event.source.chat_id == "C123"
+        assert event.source.user_id == "U123"
+        assert event.source.thread_id == "1779460000.123456"
+
+    @pytest.mark.asyncio
+    async def test_goal_slash_without_thread_creates_thread_anchor(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1779460000.777777"}
+        )
+        command = {
+            "command": "/goal",
+            "text": "finish the report",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/goal finish the report"
+        assert event.source.thread_id == "1779460000.777777"
+
+    @pytest.mark.asyncio
+    async def test_goal_status_slash_does_not_create_thread_anchor(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1779460000.777777"}
+        )
+        command = {
+            "command": "/goal",
+            "text": "status",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/goal status"
+        assert event.source.thread_id is None
+
+    def test_extract_slash_thread_ts_supports_nested_payloads(self, adapter):
+        assert adapter._extract_slash_thread_ts({
+            "container": {"thread_ts": "1779460000.654321"},
+        }) == "1779460000.654321"
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler

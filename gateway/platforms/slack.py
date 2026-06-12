@@ -200,7 +200,13 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
 
 
 def _dedupe_slack_block_text(blocks_text: str, *plain_text_candidates: str) -> str:
-    """Drop the rich_text echo of the authored message, preserving quoted extras."""
+    """Drop Slack rich_text's authored-message echo, preserving quoted extras.
+
+    Slack's plain ``text`` field already contains what the user typed, while
+    modern rich_text blocks often repeat that text before quote/list extras.
+    Compare against both the rewritten command text (``/cmd``) and the raw
+    Slack text (``!cmd``) so bang-command rewrites do not duplicate args.
+    """
     text = (blocks_text or "").strip()
     if not text:
         return ""
@@ -3268,11 +3274,25 @@ class SlackAdapter(BasePlatformAdapter):
         # Preserve DM semantics only for DM channel IDs; shared channels must
         # keep group semantics so different users do not collide into one
         # session key.
+        #
+        # Some Slack slash-command surfaces include thread context. Preserve it
+        # when present so session-scoped commands such as ``/model`` apply to
+        # the same Slack thread/session as the next normal threaded message.
+        thread_id = command.get("thread_ts") or command.get("message_ts")
+        if not thread_id:
+            message_payload = command.get("message")
+            if isinstance(message_payload, dict):
+                thread_id = message_payload.get("thread_ts")
+        if not thread_id:
+            container_payload = command.get("container")
+            if isinstance(container_payload, dict):
+                thread_id = container_payload.get("thread_ts")
         is_dm = str(channel_id).startswith("D")
         source = self.build_source(
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            thread_id=thread_id or None,
         )
 
         event = MessageEvent(

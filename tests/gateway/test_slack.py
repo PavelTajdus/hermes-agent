@@ -187,6 +187,74 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_id == "D123"
         assert event.source.user_id == "U123"
 
+    @pytest.mark.asyncio
+    async def test_slash_command_preserves_thread_id_when_payload_includes_it(self, adapter):
+        """Thread-scoped /model must key to the same Slack thread/session."""
+        command = {
+            "command": "/model",
+            "text": "qwen --provider openrouter",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+            "thread_ts": "1700000000.123456",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/model qwen --provider openrouter"
+        assert event.source.chat_type == "group"
+        assert event.source.chat_id == "C123"
+        assert event.source.user_id == "U123"
+        assert event.source.thread_id == "1700000000.123456"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("payload_key", "payload_value"),
+        [
+            ("message_ts", "1700000000.111111"),
+            ("message", {"thread_ts": "1700000000.222222"}),
+            ("container", {"thread_ts": "1700000000.333333"}),
+        ],
+    )
+    async def test_slash_command_accepts_thread_id_payload_variants(
+        self, adapter, payload_key, payload_value
+    ):
+        command = {
+            "command": "/model",
+            "text": "gpt-5.5",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+            payload_key: payload_value,
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        expected_thread = (
+            payload_value if isinstance(payload_value, str) else payload_value["thread_ts"]
+        )
+        assert event.source.thread_id == expected_thread
+
+    @pytest.mark.asyncio
+    async def test_slash_command_ignores_malformed_nested_thread_payloads(self, adapter):
+        command = {
+            "command": "/model",
+            "text": "gpt-5.5",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+            "message": "not-a-dict",
+            "container": ["not", "a", "dict"],
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.thread_id is None
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler
